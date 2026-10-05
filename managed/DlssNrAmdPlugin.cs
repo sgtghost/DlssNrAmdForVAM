@@ -8,7 +8,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using UnityEngine;
 
-[BepInPlugin("local.dlssnramd", "DLSS-NR on AMD for VaM", "0.3.0")]
+[BepInPlugin("local.dlssnramd", "DLSS-NR on AMD for VaM", "0.3.1")]
 public class DlssNrAmdPlugin : BaseUnityPlugin
 {
     ConfigEntry<bool> _enabled;
@@ -31,6 +31,9 @@ public class DlssNrAmdPlugin : BaseUnityPlugin
     float _nextCommandCheck;
     float _moveYaw, _moveUp, _moveUntil;  // debug "move" command
     float _spinRate, _spinUntil;          // debug "spin" command
+    float _avgDt = 0.016f;                // hitch diagnostics
+    int _lastGcCount, _lastReportFrame = -1;
+    DAZClothingItem _testClothing;        // debug "clothing" command
     float _fov;                           // debug "fov" command (0 = VaM's own)
     int _sceneStage;  // 0 not requested, 1 requested, 2 loading seen, 3 done
     CameraHook _hook;
@@ -87,8 +90,58 @@ public class DlssNrAmdPlugin : BaseUnityPlugin
         DrainNative();
     }
 
+    // Debug "clothing": switches the first active clothing item of the first character off, and back on the next time.
+    void ToggleTestClothing()
+    {
+        if (_testClothing == null)
+            foreach (UnityEngine.Object o in FindObjectsOfType(typeof(DAZCharacterSelector)))
+            {
+                foreach (DAZClothingItem c in ((DAZCharacterSelector)o).clothingItems)
+                    if (c != null && c.active)
+                    {
+                        _testClothing = c;
+                        break;
+                    }
+                if (_testClothing != null) break;
+            }
+        if (_testClothing == null)
+        {
+            Logger.LogInfo("clothing: no active clothing item");
+            return;
+        }
+        _testClothing.characterSelector.ToggleClothingItem(_testClothing);
+        Logger.LogInfo("clothing: " + _testClothing.name + (_testClothing.active ? " on" : " off"));
+    }
+
+    // Diagnostics: logs every frame that took far longer than the recent average, with what ran in it.
+    // The scans run during rendering, so their cost shows in the duration of the frame they ran in.
+    void TrackHitches()
+    {
+        float dt = Time.unscaledDeltaTime;
+        int gc = GC.CollectionCount(0);
+        int prev = Time.frameCount - 1;
+        if (dt > 0.03f && dt > 2.5f * _avgDt && Time.realtimeSinceStartup > 20f)
+        {
+            string why = gc != _lastGcCount ? " GC" : "";
+            _lastGcCount = gc;
+            if (!_testCommands.Value) return;  // logged for testing only
+            if (_hook != null && _hook.MipBias.LastScanFrame == prev)
+                why += " mip-scan " + _hook.MipBias.LastScanMs.ToString("F1") + " ms (find " + _hook.MipBias.LastFindMs.ToString("F1") +
+                       " ms, " + _hook.MipBias.LastExamined + " textures)";
+            if (_hook != null && _hook.SkinMotion.LastRescanFrame == prev)
+                why += " scene-scan " + _hook.SkinMotion.LastRescanMs.ToString("F1") + " ms";
+            if (_lastReportFrame == prev) why += " report";
+            Logger.LogInfo("hitch " + (dt * 1000f).ToString("F0") + " ms at " + Time.realtimeSinceStartup.ToString("F1") + " s (average " +
+                           (_avgDt * 1000f).ToString("F0") + " ms):" + (why.Length > 0 ? why : " other"));
+        }
+        else
+            _avgDt = Mathf.Lerp(_avgDt, dt, 0.05f);
+        _lastGcCount = gc;
+    }
+
     void Update()
     {
+        TrackHitches();
         if (_toggleKey.Value.IsDown())
         {
             _enabled.Value = !_enabled.Value;
@@ -257,7 +310,7 @@ public class DlssNrAmdPlugin : BaseUnityPlugin
     // Testing aid ([Debug] TestCommands): lines in command.txt next to the plugin are executed once and the
     // file is deleted, so test scripts do not depend on window focus. Commands: dump, enable, disable,
     // exposure <x>, quality <preset>, hud [on|off], ui on|off, shot <png>, uipos <text>, state, panel [on|off],
-    // panelrects, load <scene>, fsr <version>, objmotion on|off, hairmotion on|off, glow on|off, spin <deg/s> <s>, fov <deg>,
+    // panelrects, load <scene>, fsr <version>, clothing, objmotion on|off, hairmotion on|off, glow on|off, spin <deg/s> <s>, fov <deg>,
     // move <yaw deg/s> <up m/s> <s>, pkgdiag.
     void PollCommands()
     {
@@ -339,6 +392,7 @@ public class DlssNrAmdPlugin : BaseUnityPlugin
                 case "panel":
                     _panel.Visible = parts.Length < 2 || parts[1] == "on";
                     break;
+                case "clothing": ToggleTestClothing(); break;
                 case "fsr":  // upscaler: "fsr 4.1" / "fsr 3.1"
                     if (parts.Length > 1) _fsrVersion.Value = parts[1];
                     break;
@@ -403,6 +457,7 @@ public class DlssNrAmdPlugin : BaseUnityPlugin
         {
             string fps = (_reportFrames / (now - _reportStart)).ToString("F1") + " fps";
             _lastFps = fps;
+            _lastReportFrame = Time.frameCount;
             if (_hook != null && _hook.enabled)
             {
                 // Outside rendering the camera must be back at full size, or VaM's mouse picking would be off.

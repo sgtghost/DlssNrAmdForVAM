@@ -1,4 +1,4 @@
-﻿DLSS-NR on AMD for VaM 0.3.0（个人版本）
+﻿DLSS-NR on AMD for VaM 0.3.1（个人版本）
 =========================================
 
 本插件把 Virt-A-Mate 主摄像机的画面（桌面模式）交给一个独立 Direct3D 12 设备上的 AMD FSR 3.1 处理，

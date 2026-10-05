@@ -1,4 +1,4 @@
-DLSS-NR on AMD for VaM 0.3.0 (personal build)
+DLSS-NR on AMD for VaM 0.3.1 (personal build)
 =============================================
 
 Runs Virt-A-Mate's main camera (desktop mode) through AMD FSR 3.1 on a private Direct3D 12 device, so

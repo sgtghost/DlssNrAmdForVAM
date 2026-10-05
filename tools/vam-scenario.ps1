@@ -226,6 +226,20 @@ try {
                     }
                     [IO.File]::WriteAllText($ini, $iniOriginal); Command 'quality Performance'; Start-Sleep 3
                 }
+                'J_hitch' {
+                    # Frame hitches: FSR only (DLSS-NR off) for 60 s, then the effect off for 40 s; the plugin logs slow frames.
+                    Command 'hud off'
+                    [IO.File]::WriteAllText($ini, ($iniOriginal -replace '(?m)^Enabled=.*$', 'Enabled=0'))
+                    Command 'enable'; Start-Sleep 60
+                    Command 'disable'; Start-Sleep 40
+                }
+                'J_changes' {
+                    # Scene changes still reach the motion vectors without timed searches: a clothing item off and on, then a scene reload.
+                    Command 'hud off'; Command 'enable'; Start-Sleep 10
+                    Command 'clothing'; Start-Sleep 8
+                    Command 'clothing'; Start-Sleep 8
+                    Command "load $Scene"; Start-Sleep 45
+                }
                 'U_fsrswitch' {
                     # Upscaler switched while running: by command with DLSS-NR on, then by a real click in the panel with DLSS-NR off.
                     Start-Sleep 12; [Microsoft.VisualBasic.Interaction]::AppActivate($p.Id); Start-Sleep 2

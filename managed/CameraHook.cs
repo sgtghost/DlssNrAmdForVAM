@@ -26,6 +26,7 @@ public class CameraHook : MonoBehaviour
     public MipBias MipBias { get { return _mipBias; } }
     public string MotionText { get { return ObjectMotion ? _skinMotion.Text : "object motion off"; } }
     public bool HairMotion { set { _skinMotion.HairMotion = value; } }  // debug: hair part of the object motion
+    public SkinMotion SkinMotion { get { return _skinMotion; } }
 
     const DepthTextureMode Needed = DepthTextureMode.Depth | DepthTextureMode.MotionVectors;
     // VaM's own interface: world-space canvases on "UI" (overlay shader, always on top) and "LoadUI".

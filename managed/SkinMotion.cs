@@ -17,7 +17,8 @@ public class SkinMotion
     public const int MaxDraws = 512;
     public static readonly int DrawSize = Marshal.SizeOf(typeof(MeshDraw));
     const BindingFlags Any = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-    const float ScanInterval = 3f;
+    const float SignatureInterval = 0.5f;
+    const float SettleDelay = 2f;  // search once things have settled: VaM builds clothing, hair and loaded scenes over a moment
 
     static readonly FieldInfo SkinWasInit = typeof(DAZSkinV2).GetField("_wasInit", Any);
     static readonly FieldInfo SkinSuspend = typeof(DAZSkinV2).GetField("_renderSuspend", Any);
@@ -56,6 +57,8 @@ public class SkinMotion
 
     public readonly bool Available;
     public bool HairMotion = true;
+    public float LastRescanMs;  // diagnostics
+    public int LastRescanFrame = -1;
     public string Text { get { return _text; } }
 
     DAZSkinV2[] _skins = new DAZSkinV2[0];
@@ -67,7 +70,12 @@ public class SkinMotion
     readonly Dictionary<ComputeBuffer, IntPtr> _bufferPtrs = new Dictionary<ComputeBuffer, IntPtr>();
     readonly Dictionary<Mesh, MeshInfo> _meshes = new Dictionary<Mesh, MeshInfo>();
     readonly HashSet<object> _seen = new HashSet<object>();
-    float _nextScan;
+    // Searching the scene for these objects costs ~100 ms in VaM (FindObjectsOfType walks every object), so it
+    // only happens when something that holds them can have changed (CheckForChanges), never on a timer.
+    DAZCharacterSelector[] _selectors = new DAZCharacterSelector[0];
+    bool _dirty = true, _lost, _wasLoading;  // _dirty: search right away (after switching on); _lost: a tracked object was destroyed
+    float _rescanAt = -1f, _nextSignature;
+    int _signature;
     string _text = "object motion: not scanned";
 
     public SkinMotion(ManualLogSource log)
@@ -87,14 +95,19 @@ public class SkinMotion
     public int Collect(IntPtr dst, int max)
     {
         if (!Available) return 0;
-        if (Time.realtimeSinceStartup >= _nextScan) Rescan();
+        CheckForChanges();
         int n = 0, objects = 0, hairs = 0;
         // Hair first: where it lies on skin or clothing, their tighter depth match decides.
         if (HairMotion && HairData != null && HairRend != null)
             foreach (Component h in _hairs)
             {
                 if (n >= max) break;
-                if (h == null || !h.gameObject.activeInHierarchy) continue;
+                if (h == null)
+                {
+                    _lost = true;  // destroyed: search again once things settle
+                    continue;
+                }
+                if (!h.gameObject.activeInHierarchy) continue;
                 MeshRenderer r = (MeshRenderer)HairRend.GetValue(h);
                 object data = HairData.GetValue(h);
                 if (r == null || !r.enabled || data == null) continue;
@@ -117,13 +130,19 @@ public class SkinMotion
             }
         _toDraw.Clear();
         foreach (DAZSkinV2 s in _skins)
-            if (s != null && s.isActiveAndEnabled && s.skin && s.draw && s.skinMethod != DAZSkinV2.SkinMethod.CPU &&
-                (bool)SkinWasInit.GetValue(s))
+        {
+            if (s == null) _lost = true;
+            else if (s.isActiveAndEnabled && s.skin && s.draw && s.skinMethod != DAZSkinV2.SkinMethod.CPU &&
+                     (bool)SkinWasInit.GetValue(s))
                 _toDraw.Add(s);
+        }
         foreach (DAZCharacterRun r in _runs)
-            if (r != null && r.isActiveAndEnabled && r.skin != null && r.doDraw && RunVerts.GetValue(r) != null &&
-                !(bool)RunSuspend.GetValue(r))
+        {
+            if (r == null) _lost = true;
+            else if (r.isActiveAndEnabled && r.skin != null && r.doDraw && RunVerts.GetValue(r) != null &&
+                     !(bool)RunSuspend.GetValue(r))
                 _toDraw.Add(r.skin);
+        }
         if (!DAZSkinV2.staticDraw)
             foreach (DAZSkinV2 s in _toDraw)
             {
@@ -138,7 +157,12 @@ public class SkinMotion
         if (!DAZSkinWrap.staticDraw)
             foreach (DAZSkinWrap w in _wraps)
             {
-                if (w == null || w.skin == null || (bool)WrapSuspend.GetValue(w)) continue;
+                if (w == null)
+                {
+                    _lost = true;
+                    continue;
+                }
+                if (w.skin == null || (bool)WrapSuspend.GetValue(w)) continue;
                 bool postProcess = (bool)WrapUpdateDrawDisabled.GetValue(w);
                 ComputeBuffer verts;
                 if (postProcess)
@@ -291,9 +315,94 @@ public class SkinMotion
         return mi;
     }
 
+    // One search, SettleDelay after the last change, when a scene load has ended, atoms came or went, a tracked
+    // object was destroyed, or a character's look, clothing or hair changed; right away only after switching
+    // on. Never while VaM loads.
+    void CheckForChanges()
+    {
+        float now = Time.realtimeSinceStartup;
+        SuperController sc = SuperController.singleton;
+        if (sc != null && sc.isLoading)
+        {
+            _wasLoading = true;
+            return;
+        }
+        if (_wasLoading)
+        {
+            _wasLoading = false;
+            _rescanAt = now + SettleDelay;
+        }
+        if (_lost && _rescanAt < 0f) _rescanAt = now + SettleDelay;  // not pushed back while the dead entry stays listed
+        _lost = false;
+        if (now >= _nextSignature)
+        {
+            _nextSignature = now + SignatureInterval;
+            int sig = Signature(sc);
+            if (sig != _signature)
+            {
+                _signature = sig;
+                _rescanAt = now + SettleDelay;  // each further change pushes the search back until things settle
+            }
+        }
+        if (_dirty || (_rescanAt >= 0f && now >= _rescanAt))
+        {
+            _dirty = false;
+            _rescanAt = -1f;
+            Rescan();
+        }
+    }
+
+    // Cheap fingerprint of what holds skinned meshes: the atom count and, per character, its look (and whether
+    // its skin is built) and its active clothing and hair items with the wraps and hair renderers built under
+    // them so far (VaM finishes those a while after a load or a switch). VaM's own lists, no scene search.
+    int Signature(SuperController sc)
+    {
+        int sig = sc != null ? sc.GetAtoms().Count : 0;
+        foreach (DAZCharacterSelector cs in _selectors)
+        {
+            if (cs == null)
+            {
+                sig = sig * 31 + 1;
+                continue;
+            }
+            DAZCharacter ch = cs.selectedCharacter;
+            sig = sig * 31 + (ch == null ? 0 : ch.GetInstanceID() * 4 + (ch.ready ? 1 : 0) + (ch.skin != null ? 2 : 0));
+            DAZClothingItem[] clothes = cs.clothingItems;
+            if (clothes != null)
+                foreach (DAZClothingItem c in clothes)
+                    if (c != null && c.active)
+                    {
+                        c.GetComponentsInChildren(s_wraps);
+                        sig = sig * 31 + c.GetInstanceID() + s_wraps.Count * 7919;
+                    }
+            DAZHairGroup[] hair = cs.hairItems;
+            if (hair != null)
+                foreach (DAZHairGroup h in hair)
+                    if (h != null && h.active)
+                    {
+                        h.GetComponentsInChildren(s_wraps);
+                        int built = s_wraps.Count;
+                        if (HairRenderType != null) built += h.GetComponentsInChildren(HairRenderType).Length * 101;
+                        sig = sig * 31 + h.GetInstanceID() + built * 7919;
+                    }
+        }
+        return sig;
+    }
+
+    static readonly List<DAZSkinWrap> s_wraps = new List<DAZSkinWrap>();
+
     void Rescan()
     {
-        _nextScan = Time.realtimeSinceStartup + ScanInterval;
+        System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+        RescanObjects();
+        LastRescanMs = (float)sw.Elapsed.TotalMilliseconds;
+        LastRescanFrame = Time.frameCount;
+    }
+
+    void RescanObjects()
+    {
+        _selectors = (DAZCharacterSelector[])UnityEngine.Object.FindObjectsOfType(typeof(DAZCharacterSelector));
+        _signature = Signature(SuperController.singleton);
         _skins = (DAZSkinV2[])UnityEngine.Object.FindObjectsOfType(typeof(DAZSkinV2));
         _wraps = (DAZSkinWrap[])UnityEngine.Object.FindObjectsOfType(typeof(DAZSkinWrap));
         _runs = (DAZCharacterRun[])UnityEngine.Object.FindObjectsOfType(typeof(DAZCharacterRun));
@@ -330,6 +439,7 @@ public class SkinMotion
         _bufferPtrs.Clear();
         _meshes.Clear();
         _seen.Clear();
-        _nextScan = 0f;
+        _dirty = true;
+        _rescanAt = -1f;
     }
 }
