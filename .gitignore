@@ -1,0 +1,7 @@
+# Build output (release packages are published on GitHub Releases)
+/dist/
+# Local backups of VaM files the plugin replaces
+/backup/
+# AMD FidelityFX SDK binaries: fetched separately, see README.md
+/redist/ffx/*.dll
+*.log
